@@ -19,7 +19,7 @@ from src.autoddldetect.detector import parse_keywords, build_pattern, extract_dd
 from src.autoddldetect.time_parser import resolve_relative_time
 from src.autoddldetect.summarizer import summarize_ddl
 from src.autoddldetect.renderer import categorize_ddls, format_text_ddl, render_image_card
-from src.autoddldetect.silent_monitor import should_monitor_group, notify_admin
+from src.autoddldetect.silent_monitor import should_monitor_group, format_silent_msg
 
 # 切换命令的临时存储
 group_output_format = {}
@@ -87,7 +87,22 @@ class DDLDetectPlugin(Star):
                         summary = await summarize_ddl(raw_ddl, event, self.context)
                         if summary:
                             raw_ddl["summary"] = summary
-                    await notify_admin(event, raw_ddl, silent_admin)
+                    msg_text = format_silent_msg(raw_ddl)
+                    try:
+                        from astrbot.api.star import StarTools
+                        import astrbot.api.message_components as Comp
+                        from astrbot.api.event import MessageChain
+                        chain = MessageChain()
+                        chain.chain.append(Comp.Plain(msg_text))
+                        await StarTools.send_message_by_id(
+                            type="PrivateMessage",
+                            id=silent_admin,
+                            message_chain=chain,
+                            platform=event.get_platform_name(),
+                        )
+                        logger.info(f"[SilentMonitor] 已推送 DDL 给管理员 {silent_admin}")
+                    except Exception as e:
+                        logger.error(f"[SilentMonitor] 推送失败: {e}")
 
     # ── 存储 ──────────────────────────────────────────────────
 
