@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="logo.png" width="120" alt="AutoDDLDetect">
+<img src="logo.png" width="360" alt="AutoDDLDetect">
 
 # AutoDDLDetect
 
