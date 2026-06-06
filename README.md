@@ -2,7 +2,7 @@
 
 <img src="logo.png" width="360" alt="AutoDDLDetect">
 
-# AstrBot Auto_DDL_Detect
+# AutoDDLDetect
 
 AstrBot 群聊 DDL 自动检测插件
 
@@ -13,7 +13,7 @@ AstrBot 群聊 DDL 自动检测插件
 
 </div>
 
-> **作者**: FarasMoon | [仓库地址](https://github.com/FarasMoon/astrbot_plugin_Auto_ddl_Detect)
+> **作者**: FarasMoon | [仓库](https://github.com/FarasMoon/astrbot_plugin_Auto_ddl_Detect)
 >
 > [!ATTENTION]
 > 大量 vibe coding 注意
@@ -33,7 +33,7 @@ AstrBot 群聊 DDL 自动检测插件
 
 ### 紧急分类
 
-可配置时间阈值，将 DDL 分为三类展示：
+可配置时间阈值，分三类展示：
 
 | 分类 | 默认阈值 |
 | --- | --- |
@@ -45,19 +45,19 @@ AstrBot 群聊 DDL 自动检测插件
 
 - **图片模式**：HTML 卡片渲染，支持随机背景图或纯色背景
 - **文字模式**：文本格式输出
-- 可随时切换，每个群独立记忆
+- 通过命令即时切换，每个群独立记忆
 
 ### 定时通知
 
-支持多个时间点（如 08:00, 18:00, 22:00），每日定时推送 DDL 列表。
+支持多时间点（如 `08:00, 18:00, 22:00`），每日自动推送 DDL 列表。
 
 ### 静默监听
 
-跨平台监听所有群聊 DDL，汇总推送给管理员：
+跨平台监听群聊 DDL，汇总推送给管理员私聊：
 
-- 支持跨平台认证（`sender.user_id`）
+- 跨平台认证（`sender.user_id`）
 - 多管理员（逗号分隔）
-- 黑名单 / 白名单群过滤
+- 黑名单 / 白名单群过滤（开关切换）
 - 管理员私聊 `/ddl` 查看所有监听群汇总卡片
 - 汇总卡片显示来源（群名 + 群号）
 
@@ -66,7 +66,8 @@ AstrBot 群聊 DDL 自动检测插件
 定时扫描即将截止的 DDL，提前推送提醒：
 
 - 可配置提前时间（默认 6 小时，-1 禁用）
-- 可结合 AstrBot 人格设定，由 LLM 按角色语气生成提醒
+- 使用 AstrBot 人格选择器，由 LLM 按角色语气生成提醒
+- 自动适配所有活跃平台发送（无需手动填平台名）
 - 同一条 DDL 仅提醒一次
 
 ### 过期清理
@@ -86,39 +87,37 @@ git clone https://github.com/FarasMoon/astrbot_plugin_Auto_ddl_Detect.git
 
 ---
 
-## 基础配置
+## 配置
 
-| 配置项 | 说明 | 默认值 |
-| --- | --- | --- |
-| `ddl_keywords` | DDL 检测关键词 | `截止,截止时间,截止日期,deadline,ddl,交作业` |
-| `enable_llm_summary` | 启用 LLM 总结 | 开启 |
-| `enable_auto_reply` | 检测到 DDL 后自动回复 | 关闭 |
-| `urgent_hours` | "马上截止" 阈值（小时） | 24 |
-| `soon_hours` | "很快截止" 阈值（小时） | 48 |
-| `output_format` | 输出格式（image / text） | image |
-| `background_mode` | 背景模式（image / color） | image |
-| `background_api` | 背景图 API | `https://t.alcy.cc/moez` |
-| `background_color` | 纯色背景 | `#f0f0f0` |
+### 基础配置
 
-### 静默监听配置
+| 配置项 | 类型 | 说明 | 默认值 |
+| --- | --- | --- | --- |
+| `ddl_keywords` | 文本 | DDL 检测关键词 | `截止,截止时间,截止日期,deadline,ddl,交作业` |
+| `enable_llm_summary` | 开关 | 启用 LLM 总结 | 开 |
+| `enable_auto_reply` | 开关 | 检测到 DDL 后自动回复 | 关 |
+| `urgent_hours` | 数字 | "马上截止" 阈值（小时） | 24 |
+| `soon_hours` | 数字 | "很快截止" 阈值（小时） | 48 |
+| `output_as_image` | 开关 | 以图片形式输出 | 开 |
+| `background_as_image` | 开关 | 使用背景图（否则纯色） | 开 |
+| `background_api` | 文本 | 背景图 API | `https://t.alcy.cc/moez` |
+| `background_color` | 文本 | 纯色背景 | `#f0f0f0` |
+| `background_opacity` | 浮点 | 背景图透明度 | 0.12 |
 
-| 配置项 | 说明 | 默认值 |
-| --- | --- | --- |
-| `silent_mode` | 启用静默监听 | 开启 |
-| `silent_group_mode` | 群过滤模式（blacklist / whitelist） | blacklist |
-| `silent_group_list` | 群过滤列表（逗号分隔群号） | 空 |
-| `silent_admin_sid` | 管理员用户 ID（逗号分隔，跨平台） | 空 |
-| `group_display` | 群名称 JSON 映射 | 空 |
+### 监听与提醒配置
 
-### 提醒配置
-
-| 配置项 | 说明 | 默认值 |
-| --- | --- | --- |
-| `enable_notification` | 定时通知开关 | 关闭 |
-| `notification_times` | 通知时间（HH:MM,HH:MM） | `08:00` |
-| `deadline_remind_enabled` | 截止前提醒开关 | 开启 |
-| `deadline_remind_hours` | 提前提醒小时数（-1 禁用） | 6 |
-| `deadline_remind_persona` | 提醒人格 ID | 空（默认人格） |
+| 配置项 | 类型 | 说明 | 默认值 |
+| --- | --- | --- | --- |
+| `silent_mode` | 开关 | 静默监听模式 | 开 |
+| `silent_whitelist` | 开关 | 白名单模式（关=黑名单） | 关 |
+| `silent_group_list` | 文本 | 群过滤列表（逗号分隔） | 空 |
+| `silent_admin_sid` | 文本 | 管理员用户 ID（逗号分隔） | 空 |
+| `group_display` | 文本 | 群名称 JSON 映射 | 空 |
+| `enable_notification` | 开关 | 定时通知 | 关 |
+| `notification_times` | 文本 | 通知时间（HH:MM,HH:MM） | `08:00` |
+| `deadline_remind_enabled` | 开关 | 截止前提醒 | 开 |
+| `deadline_remind_hours` | 浮点 | 提前提醒小时数（-1 禁用） | 6 |
+| `deadline_remind_persona` | 人格选择器 | 提醒时使用的人格 | 空 |
 
 ---
 
@@ -127,19 +126,19 @@ git clone https://github.com/FarasMoon/astrbot_plugin_Auto_ddl_Detect.git
 | 指令 | 说明 | 可用范围 |
 | --- | --- | --- |
 | `/ddl` | 查询今日 DDL | 群聊 / 管理员私聊（汇总） |
-| `/clearddl` / `/清除ddl` | 清除当前群今日 DDL | 群聊 / 管理员私聊（清除全部） |
+| `/clearddl` `/清除ddl` | 清除当前群今日 DDL | 群聊 / 管理员私聊（全清） |
 | `/清除所有ddl` | 清除所有群的 DDL | 仅管理员 |
 | `/ddl_image` | 切换到图片输出 | 群聊 |
 | `/ddl_text` | 切换到文字输出 | 群聊 |
 | `/ddl_test` | 测试通知效果 | 群聊 |
-| `/ddl_remind_test` | 手动触发截止前提醒 | 任何消息 |
+| `/ddl_remind_test` | 强制触发一条截止提醒 | 任何消息 |
 | `/ddl_personas` | 查看可用人格列表 | 任何消息 |
 
 ---
 
 ## 群名映射
 
-在 `group_display` 中配置 JSON 格式的群号到群名的映射，管理员汇总卡片将显示对应群名：
+在 `group_display` 中配置 JSON 格式的群号→群名映射，管理员汇总卡片将显示对应群名：
 
 ```json
 {"721647196": "学术群", "798012": "项目组"}
