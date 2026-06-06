@@ -16,14 +16,6 @@ from astrbot.api import logger
 # 扩展的 DDL 关键词模式（默认）
 DEFAULT_KEYWORDS = ["截止", "截止时间", "截止日期", "deadline", "ddl", "交作业"]
 
-# 相对时间映射
-RELATIVE_TIME_MAP = {
-    "今天": datetime.now(),
-    "明天": datetime.now() + timedelta(days=1),
-    "今晚": datetime.now(),
-    "明天晚上": datetime.now() + timedelta(days=1),
-}
-
 
 @register("ddldetect", "YourName", "DDL 检测插件 - 自动检测并保存群内 DDL 消息", "1.0.0")
 class DDLDetectPlugin(Star):
@@ -82,46 +74,80 @@ class DDLDetectPlugin(Star):
                 days_ahead = day_offset - now.weekday()
                 if is_next_week:
                     days_ahead += 7
-                elif days_ahead <= 0:  # 单独的"周四"默认指本周四（如果已过则指下周）
+                elif days_ahead <= 0:
                     days_ahead += 7
                 target = now + timedelta(days=days_ahead)
                 return target.strftime("%m月%d日")
 
         return matched_time
 
-    def _extract_ddl(self, message: str) -> Optional[Tuple[str, str]]:
-        """
-        从消息中提取 DDL
-
-        Returns:
-            (任务描述, 截止时间) 或 None
-        """
+    def _extract_ddl_regex(self, message: str) -> Optional[Tuple[str, str]]:
+        """使用正则从消息中提取 DDL"""
         match = self.ddl_pattern.search(message)
         if not match:
             return None
 
-        keyword = match.group(1)
         time_part = match.group(2) if match.lastindex >= 2 else ""
-
-        # 解析相对时间
         time_part = self._resolve_relative_time(time_part)
-
-        # 提取任务描述（截止时间之前的内容）
-        task_end = match.start(2) if match.lastindex >= 2 else match.end()
         task_desc = message[:match.start()].strip()
 
         return task_desc, time_part
 
+    async def _extract_ddl_llm(self, message: str) -> Optional[Tuple[str, str]]:
+        """使用 LLM 判断是否为 DDL 消息并提取"""
+        try:
+            prompt = f"""判断以下消息是否为DDL(截止日期)通知消息。如果是，提取任务内容和截止时间。
+
+消息：{message}
+
+请按以下格式回复：
+- 如果是DDL消息：是|任务内容|截止时间
+- 如果不是DDL消息：否
+
+示例：
+消息：期末论文截止周四晚上19点
+回复：是|期末论文|周四晚上19点
+
+消息：今天天气真好
+回复：否"""
+            
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id="",
+                prompt=prompt,
+            )
+            
+            if not llm_resp:
+                return None
+            
+            result = llm_resp.completion_text.strip()
+            if result.startswith("是|"):
+                parts = result.split("|")
+                if len(parts) >= 3:
+                    task = parts[1].strip()
+                    time = self._resolve_relative_time(parts[2].strip())
+                    return task, time
+            return None
+        except Exception as e:
+            logger.error(f"LLM 检测失败: {e}")
+            return None
+
     async def initialize(self) -> None:
         """插件初始化"""
-        logger.info(f"DDL 检测插件已加载，关键词: {self.keywords}")
+        mode = self.config.get("detect_mode", "regex")
+        logger.info(f"DDL 检测插件已加载，模式: {mode}，关键词: {self.keywords}")
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent) -> MessageEventResult:
         """监听群消息，检测 DDL 格式"""
         message_str = event.message_str.strip()
+        detect_mode = self.config.get("detect_mode", "regex")
 
-        ddl_info = self._extract_ddl(message_str)
+        # 根据模式选择检测方式
+        if detect_mode == "llm":
+            ddl_info = await self._extract_ddl_llm(message_str)
+        else:
+            ddl_info = self._extract_ddl_regex(message_str)
+
         if not ddl_info:
             return
 
@@ -143,11 +169,10 @@ class DDLDetectPlugin(Star):
         await self._save_ddl(group_id, raw_ddl)
         logger.info(f"检测到 DDL: {message_str}")
 
-        # 检查是否启用自动回复
         if self.config.get("enable_auto_reply", True):
             summary = await self._summarize_ddl(raw_ddl) if self.config.get("enable_llm_summary", True) else None
             if summary:
-                yield event.plain_result(f"已检测到 DDL 并保存：\n{summary}")
+                yield event.plain_result(f"已检测到 DDL：{summary}")
 
     async def _save_ddl(self, group_id: str, ddl_data: dict) -> None:
         """保存 DDL 到存储"""
@@ -157,29 +182,29 @@ class DDLDetectPlugin(Star):
         await self.put_kv_data(key, ddl_list)
 
     async def _summarize_ddl(self, ddl_data: dict) -> Optional[str]:
-        """调用 LLM 总结 DDL"""
+        """调用 LLM 总结 DDL（不超过15字，无标点）"""
         try:
-            prompt = self._build_summary_prompt(ddl_data)
+            prompt = f"""用不超过15个字总结以下DDL，不要带任何标点符号：
+
+任务：{ddl_data.get('task', '未知')}
+截止：{ddl_data['ddl_time']}
+
+直接输出总结，不要其他内容。"""
+            
             llm_resp = await self.context.llm_generate(
                 chat_provider_id="",
                 prompt=prompt,
             )
-            return llm_resp.completion_text.strip() if llm_resp else None
+            if not llm_resp:
+                return None
+            
+            # 移除标点符号
+            result = llm_resp.completion_text.strip()
+            result = re.sub(r'[，。！？、；：""''（）【】《》\s]', '', result)
+            return result[:15] if len(result) > 15 else result
         except Exception as e:
             logger.error(f"LLM 总结失败: {e}")
             return None
-
-    def _build_summary_prompt(self, ddl_data: dict) -> str:
-        """构建 LLM 总结提示词"""
-        return f"""请帮我总结以下 DDL 信息，提取关键内容：
-
-任务描述：{ddl_data.get('task', '未知')}
-原始消息：{ddl_data['raw_message']}
-截止时间：{ddl_data['ddl_time']}
-发送者：{ddl_data['sender']}
-检测时间：{ddl_data['detected_at']}
-
-请用一句话总结这个 DDL，包含任务内容和截止时间。"""
 
     @filter.command("ddl")
     async def query_ddl(self, event: AstrMessageEvent) -> MessageEventResult:
@@ -198,15 +223,12 @@ class DDLDetectPlugin(Star):
             yield event.plain_result("今日暂无保存的 DDL。")
             return
 
-        result = [f"今日 DDL 共 {len(today_ddls)} 条：\n"]
+        result = [f"今日 DDL 共 {len(today_ddls)} 条："]
         for i, ddl in enumerate(today_ddls, 1):
-            ddl_time = ddl.get('ddl_time', '未知')
             sender = ddl.get('sender', '未知')
-            msg_preview = ddl.get('raw_message', '')[:50]
-            result.append(
-                f"{i}. {ddl_time} - {sender}\n"
-                f"   {msg_preview}..."
-            )
+            task = ddl.get('task', '')[:20] or ddl.get('raw_message', '')[:20]
+            ddl_time = ddl.get('ddl_time', '未知')
+            result.append(f"{i}. {sender} | {task} | {ddl_time}")
 
         yield event.plain_result("\n".join(result))
 

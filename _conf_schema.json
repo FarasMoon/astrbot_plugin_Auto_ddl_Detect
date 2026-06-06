@@ -1,14 +1,15 @@
 {
+  "detect_mode": {
+    "description": "DDL 检测模式",
+    "type": "string",
+    "default": "regex",
+    "hint": "regex: 使用正则表达式匹配；llm: 使用 LLM 判断是否为 DDL 消息",
+    "options": ["regex", "llm"]
+  },
   "ddl_keywords": {
-    "description": "DDL 关键词，多个用英文逗号分隔",
+    "description": "DDL 关键词（正则模式有效），多个用英文逗号分隔",
     "type": "string",
     "default": "截止,截止时间,截止日期,deadline,ddl,交作业"
-  },
-  "time_patterns": {
-    "description": "时间匹配模式",
-    "type": "text",
-    "hint": "每行一个正则表达式正则，第一个捕获组应为时间部分",
-    "default": "(\\d{1,2}月\\d{1,2}日(?:\\s*[0-2]?\\d点(?:\\d{1,2}分?)?)?)\\s*\n(\\d{1,2}[/-]\\d{1,2}(?:[日/]?)(?:\\s*[0-2]?\\d点(?:\\d{1,2}分?)?)?)\\s*\n(\\d{4}年\\d{1,2}月\\d{1,2}日(?:\\s*[0-2]?\\d点(?:\\d{1,2}分?)?)?)\\s*\n(今天(?:\\s*[0-2]?\\d点(?:\\d{1,2}分?)?)?)\\s*\n(明天(?:\\s*[0-2]?\\d点(?:\\d{1,2}分?)?)?)\\s*\n(今晚(?:\\s*[0-2]?\\d点(?:\\d{1,2}分?)?)?)\\s*\n(本周[一二三四五六日]\\s*)\n(下周[一二三四五六日]\\s*)"
   },
   "enable_llm_summary": {
     "description": "是否启用 LLM 总结",
