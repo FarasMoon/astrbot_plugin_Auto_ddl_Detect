@@ -456,14 +456,18 @@ class DDLDetectPlugin(Star):
 
         # 临时清空去重集，允许再次提醒
         self._reminded_ddls.clear()
-        yield event.plain_result("🔄 已清空提醒去重记录，开始检查...")
-        sent, total, skip_t, skip_p = await self._check_deadline_reminders(remind_hours)
+
+        persona_id = self.config.get("deadline_remind_persona", "")
+        persona_note = f"（人格: {persona_id}）" if persona_id else "（使用默认人格）"
+        yield event.plain_result(f"🔄 强制触发提醒{persona_note}，开始生成...")
+
+        sent, total, skip_t, skip_p = await self._check_deadline_reminders(remind_hours, force=True)
         if sent > 0:
             yield event.plain_result(f"✅ 已发送 {sent} 条提醒，请查看管理员私聊")
         else:
             yield event.plain_result(
                 f"⚠️ 未发送任何提醒（共检查 {total} 条 DDL，"
-                f"解析失败 {skip_p} 条，不在 {remind_hours}h 窗口内 {skip_t} 条）"
+                f"解析失败 {skip_p} 条）"
             )
 
     @filter.command("ddl_personas")
@@ -526,8 +530,9 @@ class DDLDetectPlugin(Star):
                 logger.error(f"[DeadlineReminder] 循环异常: {e}")
             await asyncio.sleep(300)  # 每 5 分钟检查一次
 
-    async def _check_deadline_reminders(self, remind_hours: float):
-        """检查所有监听群的 DDL，提醒即将截止的。返回 (发送数, 总数, 过滤数)"""
+    async def _check_deadline_reminders(self, remind_hours: float, force: bool = False):
+        """检查所有监听群的 DDL，提醒即将截止的。force=True 时忽略时间窗口，强制发送第一条。
+        返回 (发送数, 总数, 过滤数)"""
         from astrbot.api.star import StarTools
         import astrbot.api.message_components as Comp
         from astrbot.api.event import MessageChain
@@ -552,21 +557,30 @@ class DDLDetectPlugin(Star):
             for ddl in valid_ddls:
                 total_checked += 1
                 ddl_time_str = ddl.get('ddl_time', '')
-                deadline = _parse_time(ddl_time_str)
-                if not deadline:
-                    skipped_parse += 1
-                    continue
 
-                remaining = (deadline - now).total_seconds() / 3600
-                if remaining < 0 or remaining > remind_hours:
-                    skipped_time += 1
-                    continue
+                if force:
+                    # 强制模式：跳过时间窗口和去重，仅取第一条有效 DDL
+                    if notified_count >= 1:
+                        continue
+                else:
+                    deadline = _parse_time(ddl_time_str)
+                    if not deadline:
+                        skipped_parse += 1
+                        continue
 
-                # 去重
-                dedup_key = (gid, ddl.get('detected_at', ''), ddl_time_str)
-                if dedup_key in self._reminded_ddls:
-                    continue
-                self._reminded_ddls.add(dedup_key)
+                    remaining = (deadline - now).total_seconds() / 3600
+                    if remaining < 0 or remaining > remind_hours:
+                        skipped_time += 1
+                        continue
+
+                    # 去重
+                    dedup_key = (gid, ddl.get('detected_at', ''), ddl_time_str)
+                    if dedup_key in self._reminded_ddls:
+                        continue
+                    self._reminded_ddls.add(dedup_key)
+
+                deadline = _parse_time(ddl_time_str) if force else deadline
+                remaining = max(0, ((deadline - now).total_seconds() / 3600) if deadline else 0)
 
                 # 构建提醒
                 group_label = self._get_group_label(gid)
