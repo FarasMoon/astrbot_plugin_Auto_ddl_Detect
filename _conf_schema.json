@@ -20,5 +20,35 @@
     "description": "检测到 DDL 后是否自动回复",
     "type": "bool",
     "default": true
+  },
+  "output_format": {
+    "description": "DDL 输出格式",
+    "type": "string",
+    "default": "text",
+    "hint": "text: 文字输出；image: 图片输出",
+    "options": ["text", "image"]
+  },
+  "background_api": {
+    "description": "背景图 API",
+    "type": "string",
+    "default": "https://www.dmoe.cc/random.php",
+    "hint": "用于生成随机背景图的 API 地址"
+  },
+  "background_opacity": {
+    "description": "背景图透明度",
+    "type": "number",
+    "default": 0.3,
+    "hint": "0.0 为完全透明，1.0 为完全不透明"
+  },
+  "enable_notification": {
+    "description": "是否启用定时通知",
+    "type": "bool",
+    "default": false
+  },
+  "notification_time": {
+    "description": "定时通知时间",
+    "type": "string",
+    "default": "08:00",
+    "hint": "每天通知的时间，格式：HH:MM"
   }
 }

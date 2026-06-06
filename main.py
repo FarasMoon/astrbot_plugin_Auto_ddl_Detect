@@ -4,6 +4,7 @@ DDL 检测插件入口文件
 """
 
 import re
+import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
@@ -16,8 +17,180 @@ from astrbot.api import logger
 # 扩展的 DDL 关键词模式（默认）
 DEFAULT_KEYWORDS = ["截止", "截止时间", "截止日期", "deadline", "ddl", "交作业"]
 
+# HTML 模板
+HTML_TMPL = '''
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>今日 DDL</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+            width: 600px;
+            min-height: 400px;
+            position: relative;
+            padding: 40px;
+        }
+        
+        .background {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: url('{{ background_url }}') center center/cover no-repeat;
+            opacity: {{ opacity }};
+            z-index: 0;
+        }
+        
+        .content {
+            position: relative;
+            z-index: 1;
+            background: rgba(255, 255, 255, 0.85);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 25px;
+            padding-bottom: 20px;
+            border-bottom: 2px solid #e0e0e0;
+        }
+        
+        .header h1 {
+            font-size: 32px;
+            color: #333;
+            font-weight: bold;
+        }
+        
+        .header .date {
+            margin-top: 10px;
+            font-size: 16px;
+            color: #666;
+        }
+        
+        .ddl-list {
+            list-style: none;
+        }
+        
+        .ddl-item {
+            padding: 18px;
+            margin-bottom: 15px;
+            background: #f8f9fa;
+            border-radius: 12px;
+            border-left: 4px solid #4a90e2;
+            transition: transform 0.2s;
+        }
+        
+        .ddl-item:hover {
+            transform: translateX(5px);
+        }
+        
+        .ddl-item:last-child {
+            margin-bottom: 0;
+        }
+        
+        .ddl-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .ddl-number {
+            font-size: 14px;
+            color: #4a90e2;
+            font-weight: bold;
+        }
+        
+        .ddl-sender {
+            font-size: 14px;
+            color: #888;
+            background: #e8f0fe;
+            padding: 4px 12px;
+            border-radius: 20px;
+        }
+        
+        .ddl-task {
+            font-size: 18px;
+            color: #333;
+            font-weight: 500;
+            margin-bottom: 8px;
+        }
+        
+        .ddl-time {
+            font-size: 15px;
+            color: #e74c3c;
+            font-weight: bold;
+        }
+        
+        .empty {
+            text-align: center;
+            padding: 40px;
+            color: #888;
+            font-size: 18px;
+        }
+        
+        .footer {
+            text-align: center;
+            margin-top: 25px;
+            padding-top: 20px;
+            border-top: 1px solid #e0e0e0;
+            color: #999;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="background"></div>
+    <div class="content">
+        <div class="header">
+            <h1>📋 今日 DDL</h1>
+            <div class="date">{{ date }}</div>
+        </div>
+        
+        {% if ddls %}
+            <ul class="ddl-list">
+                {% for ddl in ddls %}
+                    <li class="ddl-item">
+                        <div class="ddl-header">
+                            <span class="ddl-number">#{{ loop.index }}</span>
+                            <span class="ddl-sender">{{ ddl.sender }}</span>
+                        </div>
+                        <div class="ddl-task">{{ ddl.task }}</div>
+                        <div class="ddl-time">⏰ {{ ddl.ddl_time }}</div>
+                    </li>
+                {% endfor %}
+            </ul>
+        {% else %}
+            <div class="empty">
+                ✨ 今日暂无 DDL，享受美好的一天吧！
+            </div>
+        {% endif %}
+        
+        <div class="footer">
+            Powered by AstrBot DDL Detect Plugin
+        </div>
+    </div>
+</body>
+</html>
+'''
 
-@register("ddldetect", "FarasMoon", "DDL 检测插件 - 自动检测并保存群内 DDL 消息", "1.1.0")
+# 切换命令的临时存储
+group_output_format = {}
+
+
+@register("ddldetect", "YourName", "DDL 检测插件 - 自动检测并保存群内 DDL 消息", "1.2.0")
 class DDLDetectPlugin(Star):
     """DDL 检测插件主类"""
 
@@ -26,6 +199,7 @@ class DDLDetectPlugin(Star):
         self.config = config
         self.keywords = self._parse_keywords()
         self.ddl_pattern = self._build_pattern()
+        self.notification_task = None
 
     def _parse_keywords(self) -> list:
         """解析 DDL 关键词配置"""
@@ -219,19 +393,98 @@ class DDLDetectPlugin(Star):
             if ddl.get('detected_at', '').startswith(today)
         ]
 
-        if not today_ddls:
-            yield event.plain_result("今日暂无保存的 DDL。")
-            return
+        # 获取输出格式
+        output_format = group_output_format.get(group_id, self.config.get("output_format", "text"))
 
-        result = [f"今日 DDL 共 {len(today_ddls)} 条："]
-        for i, ddl in enumerate(today_ddls, 1):
+        if output_format == "image":
+            try:
+                background_api = self.config.get("background_api", "https://www.dmoe.cc/random.php")
+                opacity = self.config.get("background_opacity", 0.3)
+                date_str = datetime.now().strftime("%Y年%m月%d日 %A")
+                
+                url = await self.html_render(HTML_TMPL, {
+                    "date": date_str,
+                    "ddls": today_ddls,
+                    "background_url": background_api,
+                    "opacity": opacity
+                })
+                yield event.image_result(url)
+            except Exception as e:
+                logger.error(f"生成图片失败: {e}")
+                # 降级到文字输出
+                yield event.plain_result("生成图片失败，以下是文字版：\n" + self._format_text_ddl(today_ddls))
+        else:
+            yield event.plain_result(self._format_text_ddl(today_ddls))
+
+    def _format_text_ddl(self, ddls: list) -> str:
+        """格式化文字 DDL 输出"""
+        if not ddls:
+            return "今日暂无保存的 DDL。"
+        
+        result = [f"今日 DDL 共 {len(ddls)} 条："]
+        for i, ddl in enumerate(ddls, 1):
             sender = ddl.get('sender', '未知')
             task = ddl.get('task', '')[:20] or ddl.get('raw_message', '')[:20]
             ddl_time = ddl.get('ddl_time', '未知')
             result.append(f"{i}. {sender} | {task} | {ddl_time}")
+        
+        return "\n".join(result)
 
-        yield event.plain_result("\n".join(result))
+    @filter.command("ddl_image")
+    async def switch_to_image(self, event: AstrMessageEvent) -> MessageEventResult:
+        """切换到图片输出"""
+        group_id = event.message_obj.group_id or "unknown"
+        group_output_format[group_id] = "image"
+        yield event.plain_result("✅ 已切换到图片输出模式")
+
+    @filter.command("ddl_text")
+    async def switch_to_text(self, event: AstrMessageEvent) -> MessageEventResult:
+        """切换到文字输出"""
+        group_id = event.message_obj.group_id or "unknown"
+        group_output_format[group_id] = "text"
+        yield event.plain_result("✅ 已切换到文字输出模式")
+
+    @filter.command("ddl_test")
+    async def test_notification(self, event: AstrMessageEvent) -> MessageEventResult:
+        """测试定时通知"""
+        group_id = event.message_obj.group_id or "unknown"
+        key = f"ddl_{group_id}"
+        ddl_list = await self.get_kv_data(key, [])
+        today = datetime.now().strftime("%Y-%m-%d")
+        today_ddls = [
+            ddl for ddl in ddl_list
+            if ddl.get('detected_at', '').startswith(today)
+        ]
+        
+        if not today_ddls:
+            yield event.plain_result("今日暂无 DDL 可测试")
+            return
+        
+        output_format = group_output_format.get(group_id, self.config.get("output_format", "text"))
+        if output_format == "image":
+            try:
+                background_api = self.config.get("background_api", "https://www.dmoe.cc/random.php")
+                opacity = self.config.get("background_opacity", 0.3)
+                date_str = datetime.now().strftime("%Y年%m月%d日 %A")
+                
+                url = await self.html_render(HTML_TMPL, {
+                    "date": date_str,
+                    "ddls": today_ddls,
+                    "background_url": background_api,
+                    "opacity": opacity
+                })
+                yield event.image_result(url)
+            except Exception as e:
+                yield event.plain_result(f"生成测试图片失败: {e}")
+        else:
+            yield event.plain_result(self._format_text_ddl(today_ddls))
 
     async def terminate(self) -> None:
         """插件销毁时调用"""
+        if self.notification_task and not self.notification_task.done():
+            self.notification_task.cancel()
+            try:
+                await self.notification_task
+            except asyncio.CancelledError:
+                pass
         logger.info("DDL 检测插件已卸载")

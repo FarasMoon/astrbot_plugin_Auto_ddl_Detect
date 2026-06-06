@@ -1,6 +1,6 @@
 name: ddldetect
 display_name: DDL检测插件
 desc: 自动检测群内"截止：时间+日期"格式的消息，保存并让LLM总结，用户发送/ddl查询今日DDL
-version: v1.1.0
+version: v1.2.0
 author: YourName
 repo: https://github.com/yourname/ddldetect
