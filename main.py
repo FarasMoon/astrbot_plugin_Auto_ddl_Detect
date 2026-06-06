@@ -19,7 +19,35 @@ from src.autoddldetect.detector import parse_keywords, build_pattern, extract_dd
 from src.autoddldetect.time_parser import resolve_relative_time
 from src.autoddldetect.summarizer import summarize_ddl
 from src.autoddldetect.renderer import categorize_ddls, format_text_ddl, render_image_card
-from src.autoddldetect.silent_monitor import should_monitor_group, format_silent_msg
+
+
+# ── 静默监听工具函数 ────────────────────────────────────────
+
+def _should_monitor_group(group_id: str, group_mode: str, group_list_str: str) -> bool:
+    """判断群是否应被静默监听"""
+    if not group_list_str.strip():
+        return group_mode == "blacklist"
+    group_ids = [g.strip() for g in group_list_str.split(",") if g.strip()]
+    if group_mode == "blacklist":
+        return group_id not in group_ids
+    return group_id in group_ids
+
+
+def _format_silent_msg(raw_ddl: dict) -> str:
+    """格式化静默监听推送消息"""
+    task = raw_ddl.get("summary") or raw_ddl.get("task", raw_ddl.get("raw_message", ""))
+    ddl_time = raw_ddl.get("ddl_time", "未知")
+    sender = raw_ddl.get("sender", "未知")
+    group_id = raw_ddl.get("group_id", "未知")
+    detected_at = raw_ddl.get("detected_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    return (
+        f"[DDL监听]\n"
+        f"群: {group_id}\n"
+        f"任务: {task}\n"
+        f"截止: {ddl_time}\n"
+        f"来自: {sender}\n"
+        f"时间: {detected_at}"
+    )
 
 # 切换命令的临时存储
 group_output_format = {}
@@ -82,12 +110,12 @@ class DDLDetectPlugin(Star):
             if silent_admin:
                 group_mode = self.config.get("silent_group_mode", "blacklist")
                 group_list_str = self.config.get("silent_group_list", "")
-                if should_monitor_group(group_id, group_mode, group_list_str):
+                if _should_monitor_group(group_id, group_mode, group_list_str):
                     if self.config.get("enable_llm_summary", True):
                         summary = await summarize_ddl(raw_ddl, event, self.context)
                         if summary:
                             raw_ddl["summary"] = summary
-                    msg_text = format_silent_msg(raw_ddl)
+                    msg_text = _format_silent_msg(raw_ddl)
                     try:
                         from astrbot.api.star import StarTools
                         import astrbot.api.message_components as Comp
