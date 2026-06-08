@@ -636,8 +636,44 @@ class DDLDetectPlugin(Star):
             lines.append(f"  剩余时间: {remaining:.1f} 小时")
         lines.append("")
 
-        # Step 5: 会触发什么
-        lines.append("【5】触发行为")
+        # Step 5: LLM 总结测试（实际调用并展示 prompt + 响应）
+        lines.append("【5】LLM 总结测试")
+        if self.config.get("enable_llm_summary", True):
+            dummy_ddl = {"task": task_desc, "ddl_time": ddl_time}
+            summary_prompt = f"用不超过50个字总结以下DDL任务，不要带任何标点符号，直接输出总结文本：\n\n任务：{dummy_ddl.get('task', '?')}\n截止：{dummy_ddl['ddl_time']}"
+            lines.append(f"  发送 prompt:")
+            for pline in summary_prompt.split("\n"):
+                lines.append(f"    {pline}")
+            lines.append("")
+            try:
+                import re as _re
+                # 手动调 LLM 以获取原始响应
+                umo = event.unified_msg_origin
+                llm_pid = await self.context.get_current_chat_provider_id(umo=umo)
+                if llm_pid:
+                    raw_resp = await self.context.llm_generate(
+                        chat_provider_id=llm_pid,
+                        prompt=summary_prompt,
+                    )
+                    if raw_resp and raw_resp.completion_text:
+                        raw_text = raw_resp.completion_text.strip()
+                        lines.append(f"  LLM 原始响应: {raw_text}")
+                        # 展示清洗过程
+                        cleaned = _re.sub(r'[，。！？、；：""''（）【】《》\s]', '', raw_text)
+                        cleaned = cleaned[:50] if len(cleaned) > 50 else cleaned
+                        lines.append(f"  清洗后: {cleaned}")
+                    else:
+                        lines.append(f"  LLM 原始响应: (空)")
+                else:
+                    lines.append(f"  未找到 LLM 模型")
+            except Exception as e:
+                lines.append(f"  总结异常: {e}")
+        else:
+            lines.append("  ❌ LLM 总结: 已关闭")
+        lines.append("")
+
+        # Step 6: 会触发什么
+        lines.append("【6】触发行为")
         if self.config.get("enable_auto_reply", False):
             lines.append("  ✅ auto_reply: 会在群内回复")
         else:
