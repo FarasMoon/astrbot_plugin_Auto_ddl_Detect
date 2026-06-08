@@ -14,6 +14,8 @@ __all__ = [
     "parse_keywords",
     "build_pattern",
     "extract_ddl",
+    "classify_ddl",
+    "CLASSIFY_PROMPT",
     "resolve_relative_time",
     "parse_ddl_time",
     "summarize_ddl",
