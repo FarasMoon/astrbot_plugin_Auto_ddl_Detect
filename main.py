@@ -24,10 +24,6 @@ from lib.monitor import should_monitor_group, format_silent_msg
 from lib.storage import MAX_DDL_PER_GROUP, clean_expired_ddls, filter_today
 
 
-# ── 切换命令的临时存储 ────────────────────────────────────────
-group_output_format = {}
-
-
 @register("autoddldetect", "FarasMoon", "DDL 检测插件 - 自动检测并保存群内 DDL 消息", "1.2.0")
 class DDLDetectPlugin(Star):
     """DDL 检测插件主类"""
@@ -352,10 +348,7 @@ class DDLDetectPlugin(Star):
                                     break
                         await self.put_kv_data(key, ddl_list)
 
-        output_format = group_output_format.get(
-            group_id,
-            "image" if self.config.get("output_as_image", True) else "text"
-        )
+        output_format = "image" if self.config.get("output_as_image", True) else "text"
         source_info = ""
         if group_id == "__admin_all_groups__":
             source_info = self._build_source_info(today_ddls)
@@ -425,67 +418,6 @@ class DDLDetectPlugin(Star):
 
         self.monitored_groups.clear()
         return f"✅ 已清除 {total_removed} 个群的全部 DDL 记录"
-
-    # ── 切换输出格式 ──────────────────────────────────────────
-
-    @filter.command("ddl_image")
-    async def switch_to_image(self, event: AstrMessageEvent) -> MessageEventResult:
-        group_id = event.message_obj.group_id or "unknown"
-        group_output_format[group_id] = "image"
-        yield event.plain_result("✅ 已切换到图片输出模式")
-
-    @filter.command("ddl_text")
-    async def switch_to_text(self, event: AstrMessageEvent) -> MessageEventResult:
-        group_id = event.message_obj.group_id or "unknown"
-        group_output_format[group_id] = "text"
-        yield event.plain_result("✅ 已切换到文字输出模式")
-
-    # ── 测试 ──────────────────────────────────────────────────
-
-    @filter.command("ddl_test")
-    async def test_notification(self, event: AstrMessageEvent) -> MessageEventResult:
-        """测试定时通知"""
-        group_id = event.message_obj.group_id or "unknown"
-        key = f"ddl_{group_id}"
-        ddl_list = await self.get_kv_data(key, [])
-        today = datetime.now().strftime("%Y-%m-%d")
-        today_ddls = [ddl for ddl in ddl_list if ddl.get('detected_at', '').startswith(today)]
-
-        if not today_ddls:
-            yield event.plain_result("今日暂无 DDL 可测试")
-            return
-
-        urgent_hours = self.config.get("urgent_hours", 24)
-        soon_hours = self.config.get("soon_hours", 48)
-        urgent_ddls, soon_ddls, normal_ddls = categorize_ddls(today_ddls, urgent_hours, soon_hours)
-
-        output_format = group_output_format.get(
-            group_id,
-            "image" if self.config.get("output_as_image", True) else "text"
-        )
-
-        if self.config.get("enable_llm_summary", True):
-            for ddl in urgent_ddls + soon_ddls + normal_ddls:
-                if ddl.get("summary"):
-                    continue
-                summary = await summarize_ddl(ddl, event, self.context)
-                if summary:
-                    ddl['summary'] = summary
-
-        if output_format == "image":
-            try:
-                bg_as_image = self.config.get("background_as_image", True)
-                bg_value = self.config.get("background_color", "#f0f0f0") if not bg_as_image else self.config.get("background_api", "https://t.alcy.cc/moez")
-                bg_mode = "image" if bg_as_image else "color"
-                url = await render_image_card(
-                    self, urgent_ddls, soon_ddls, normal_ddls,
-                    urgent_hours, soon_hours, bg_mode, bg_value
-                )
-                yield event.image_result(url)
-            except Exception as e:
-                yield event.plain_result(f"生成测试图片失败: {e}")
-        else:
-            yield event.plain_result(format_text_ddl(urgent_ddls, soon_ddls, normal_ddls, urgent_hours, soon_hours))
 
     @filter.command("ddl_remind_test")
     async def test_reminder(self, event: AstrMessageEvent) -> MessageEventResult:
@@ -688,24 +620,6 @@ class DDLDetectPlugin(Star):
             lines.append("  ❌ LLM 总结: 已关闭")
 
         yield event.plain_result("\n".join(lines))
-
-    @filter.command("ddl_personas")
-    async def list_personas(self, event: AstrMessageEvent) -> MessageEventResult:
-        """列出 AstrBot 中可用的人格列表"""
-        try:
-            persona_mgr = self.context.persona_manager
-            personas = await persona_mgr.get_all_personas()
-            if not personas:
-                yield event.plain_result("📭 当前无可用人格，请在 AstrBot 人格设置中创建")
-                return
-
-            lines = ["📋 可用人格列表（填入 deadline_remind_persona）："]
-            for p in personas:
-                pid = getattr(p, 'persona_id', '?')
-                lines.append(f"  - {pid}")
-            yield event.plain_result("\n".join(lines))
-        except Exception as e:
-            yield event.plain_result(f"获取人格列表失败: {e}")
 
     # ── 销毁 ──────────────────────────────────────────────────
 
