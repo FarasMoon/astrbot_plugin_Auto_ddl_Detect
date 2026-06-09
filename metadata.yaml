@@ -1,7 +1,7 @@
 name: "astrbot_plugin_Auto_ddl_Detect"
 display_name: ddl通知消息自动检测
 desc: 自动检测群内ddl格式的消息，防止睡觉错过消息）
-version: v1.2.0
+version: v1.2.1
 author: FarasMoon
 repo: https://github.com/FarasMoon/astrbot_plugin_Auto_ddl_Detect
 logo_path: "logo.png"

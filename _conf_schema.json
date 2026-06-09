@@ -19,6 +19,12 @@
     "hint": "留空使用群聊默认模型；选择后仅用于 DDL 语义验证",
     "condition": {"ddl_detect_mode": "正则+LLM 验证"}
   },
+  "custom_time_patterns": {
+    "description": "自定义时间正则（每行一条，追加到内置规则后）",
+    "type": "string",
+    "default": "",
+    "hint": "每行一条 Python 正则，如: \\d{4}-\\d{2}-\\d{2}；留空仅用内置规则"
+  },
   "enable_llm_summary": {
     "description": "是否启用 LLM 总结（图片和文字模式均支持）",
     "type": "bool",

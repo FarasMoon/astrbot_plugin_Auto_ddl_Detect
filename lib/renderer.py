@@ -1,5 +1,6 @@
 """渲染模块：分类 + 格式化"""
 
+import asyncio
 from datetime import datetime
 from typing import Any
 
@@ -104,5 +105,8 @@ async def render_image_card(context: Any, urgent_ddls: list, soon_ddls: list,
         "gen_time": gen_time,
     }
 
-    return await context.html_render(HTML_TMPL, template_vars,
-        options={"type": "png", "viewport": {"width": 520, "height": 100}, "full_page": True})
+    return await asyncio.wait_for(
+        context.html_render(HTML_TMPL, template_vars,
+            options={"type": "png", "viewport": {"width": 520, "height": 100}, "full_page": True}),
+        timeout=20
+    )
