@@ -1,5 +1,6 @@
 """渲染模块：分类 + 格式化"""
 
+import asyncio
 from datetime import datetime
 from typing import Any
 
@@ -82,7 +83,8 @@ async def render_image_card(context: Any, urgent_ddls: list, soon_ddls: list,
                             normal_ddls: list, urgent_hours: int, soon_hours: int,
                             background_mode: str = "image",
                             background_value: str = "",
-                            source_info: str = "") -> str:
+                            source_info: str = "",
+                            gen_time: str = "") -> str:
     """渲染 DDL 图片"""
     from .template import HTML_TMPL
 
@@ -100,7 +102,11 @@ async def render_image_card(context: Any, urgent_ddls: list, soon_ddls: list,
         "background_url": background_value if background_mode == "image" else "",
         "background_opacity": "0.12",
         "source_info": source_info,
+        "gen_time": gen_time,
     }
 
-    return await context.html_render(HTML_TMPL, template_vars,
-        options={"type": "png", "viewport": {"width": 520, "height": 100}, "full_page": True})
+    return await asyncio.wait_for(
+        context.html_render(HTML_TMPL, template_vars,
+            options={"type": "png", "viewport": {"width": 520, "height": 100}, "full_page": True}),
+        timeout=20
+    )

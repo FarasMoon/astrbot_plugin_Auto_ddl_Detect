@@ -1,5 +1,6 @@
 """LLM 总结模块"""
 
+import asyncio
 import re
 from typing import Optional
 
@@ -7,6 +8,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 MAX_SUMMARY_LEN = 50
+LLM_TIMEOUT = 15  # LLM 调用超时秒数
 
 
 async def summarize_ddl(ddl_data: dict, event: AstrMessageEvent, context) -> Optional[str]:
@@ -24,9 +26,12 @@ async def summarize_ddl(ddl_data: dict, event: AstrMessageEvent, context) -> Opt
 任务：{ddl_data.get('task', '未知')}
 截止：{ddl_data['ddl_time']}"""
 
-        llm_resp = await context.llm_generate(
-            chat_provider_id=llm_provider,
-            prompt=prompt,
+        llm_resp = await asyncio.wait_for(
+            context.llm_generate(
+                chat_provider_id=llm_provider,
+                prompt=prompt,
+            ),
+            timeout=LLM_TIMEOUT
         )
         if not llm_resp or not llm_resp.completion_text:
             logger.warning("LLM 总结：模型返回为空")

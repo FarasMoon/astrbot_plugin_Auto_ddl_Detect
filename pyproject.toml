@@ -32,6 +32,9 @@ Issues = "https://github.com/FarasMoon/astrbot_plugin_Auto_ddl_Detect/issues"
 where = ["."]
 include = ["lib*"]
 
+[tool.setuptools.package-data]
+lib = ["*.html"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"

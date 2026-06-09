@@ -8,86 +8,25 @@ if _plugin_dir not in sys.path:
     sys.path.insert(0, _plugin_dir)
 
 import asyncio
-from datetime import datetime, timedelta
+import json
+from datetime import datetime
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig
 from astrbot.api import logger
 
-from lib.detector import parse_keywords, build_pattern, extract_ddl
-from lib.time_parser import resolve_relative_time
+from lib.detector import (parse_keywords, build_pattern, extract_ddl,
+                          classify_ddl, CLASSIFY_PROMPT,
+                          get_time_patterns, build_time_re)
+from lib.time_parser import resolve_relative_time, parse_ddl_time
 from lib.summarizer import summarize_ddl
 from lib.renderer import categorize_ddls, format_text_ddl, render_image_card
+from lib.monitor import should_monitor_group, format_silent_msg
+from lib.storage import MAX_DDL_PER_GROUP, clean_expired_ddls, filter_today
 
 
-# ── 静默监听工具函数 ────────────────────────────────────────
-
-def _should_monitor_group(group_id: str, silent_whitelist: bool, group_list_str: str) -> bool:
-    """判断群是否应被静默监听"""
-    if not group_list_str.strip():
-        return not silent_whitelist
-    group_ids = [g.strip() for g in group_list_str.split(",") if g.strip()]
-    if silent_whitelist:
-        return group_id in group_ids
-    return group_id not in group_ids
-
-
-def _format_silent_msg(raw_ddl: dict) -> str:
-    """格式化静默监听推送消息"""
-    task = raw_ddl.get("summary") or raw_ddl.get("task", raw_ddl.get("raw_message", ""))
-    ddl_time = raw_ddl.get("ddl_time", "未知")
-    sender = raw_ddl.get("sender", "未知")
-    group_id = raw_ddl.get("group_id", "未知")
-    detected_at = raw_ddl.get("detected_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    return (
-        f"[DDL监听]\n"
-        f"群: {group_id}\n"
-        f"任务: {task}\n"
-        f"截止: {ddl_time}\n"
-        f"来自: {sender}\n"
-        f"时间: {detected_at}"
-    )
-
-
-# ── DDL 过期清理 ────────────────────────────────────────────
-
-def _clean_expired_ddls(ddl_list: list, now: datetime) -> tuple:
-    """清理已过期的 DDL，返回 (有效列表, 清理数量)"""
-    valid_ddls = []
-    removed_count = 0
-    for ddl in ddl_list:
-        ddl_time_str = ddl.get('ddl_time', '')
-        try:
-            for fmt in ['%m月%d日', '%m月%d日%H点', '%m月%d日%H:%M']:
-                try:
-                    parsed_time = datetime.strptime(ddl_time_str, fmt)
-                    parsed_time = parsed_time.replace(year=now.year)
-                    if parsed_time < now:
-                        removed_count += 1
-                    else:
-                        valid_ddls.append(ddl)
-                    break
-                except ValueError:
-                    continue
-            else:
-                valid_ddls.append(ddl)
-        except Exception:
-            valid_ddls.append(ddl)
-    return valid_ddls, removed_count
-
-
-def _filter_today(ddls: list) -> list:
-    """筛选今天的 DDL"""
-    today = datetime.now().strftime("%Y-%m-%d")
-    return [ddl for ddl in ddls if ddl.get('detected_at', '').startswith(today)]
-
-
-# 切换命令的临时存储
-group_output_format = {}
-
-
-@register("autoddldetect", "FarasMoon", "DDL 检测插件 - 自动检测并保存群内 DDL 消息", "1.2.0")
+@register("autoddldetect", "FarasMoon", "DDL 检测插件 - 自动检测并保存群内 DDL 消息", "1.2.1")
 class DDLDetectPlugin(Star):
     """DDL 检测插件主类"""
 
@@ -95,10 +34,15 @@ class DDLDetectPlugin(Star):
         super().__init__(context)
         self.config = config
         self.keywords = parse_keywords(config.get("ddl_keywords", ""))
-        self.ddl_pattern = build_pattern(self.keywords)
+        self.custom_time_patterns = self._parse_custom_time_patterns(config.get("custom_time_patterns", ""))
+        self.ddl_pattern = build_pattern(self.keywords, self.custom_time_patterns or None)
+        self.time_re = build_time_re(self.custom_time_patterns or None)
         self.notification_task = None
         self.monitored_groups: set = set()
         self.admin_ids: list = []
+        self._seen_messages: set = set()  # (group_id, message_id) 去重
+        self._msg_lock = asyncio.Lock()   # 保护 _seen_messages 并发
+        self._summary_locks: dict = {}    # per-group 锁，防 summary 写回竞态
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         """检查消息发送者是否为管理员"""
@@ -106,6 +50,12 @@ class DDLDetectPlugin(Star):
             return False
         sender_id = event.message_obj.sender.user_id if event.message_obj.sender else ""
         return sender_id in self.admin_ids
+
+    def _parse_custom_time_patterns(self, raw: str) -> list:
+        """解析自定义时间正则配置（每行一条），过滤空行"""
+        if not raw or not raw.strip():
+            return []
+        return [line.strip() for line in raw.splitlines() if line.strip()]
 
     # ── 事件处理 ──────────────────────────────────────────────
 
@@ -116,18 +66,24 @@ class DDLDetectPlugin(Star):
         self.admin_ids = [a.strip() for a in admin_str.split(",") if a.strip()]
         # 群名映射
         self._group_names = self._load_group_names()
-        # 截止提醒追踪
-        self._reminded_ddls: set = set()
+        # 截止提醒追踪（从 KV 恢复以跨重启持久化）
+        stored = await self.get_kv_data("__reminded_ddls", [])
+        self._reminded_ddls: set = set(tuple(x) for x in stored) if stored else set()
         # 启动截止前提醒后台任务
         self._reminder_task = asyncio.ensure_future(self._deadline_reminder_loop())
         logger.info(f"AutoDDLDetect 已加载，关键词: {self.keywords}，通知时间: {self.notification_times}，管理员: {self.admin_ids}")
+
+    def _get_summary_lock(self, group_id: str) -> asyncio.Lock:
+        """获取 per-group 锁（懒创建）"""
+        if group_id not in self._summary_locks:
+            self._summary_locks[group_id] = asyncio.Lock()
+        return self._summary_locks[group_id]
 
     def _load_group_names(self) -> dict:
         raw = self.config.get("group_display", "")
         if not raw.strip():
             return {}
         try:
-            import json
             return json.loads(raw)
         except Exception:
             logger.warning(f"群名称映射 JSON 解析失败: {raw}")
@@ -165,15 +121,51 @@ class DDLDetectPlugin(Star):
     async def on_group_message(self, event: AstrMessageEvent) -> MessageEventResult:
         """监听群消息，检测 DDL 格式"""
         message_str = event.message_str.strip()
-        ddl_info = extract_ddl(message_str, self.ddl_pattern, resolve_relative_time)
 
+        # 第一关：关键词预筛——消息中必须包含至少一个 DDL 关键词（不区分大小写）
+        msg_lower = message_str.lower()
+        if not any(kw.lower() in msg_lower for kw in self.keywords):
+            return
+
+        # 第二关：正则匹配——关键词 + 时间格式
+        ddl_info = extract_ddl(message_str, self.ddl_pattern, resolve_relative_time, self.time_re)
         if not ddl_info:
             return
 
         task_desc, ddl_time = ddl_info
         group_id = event.message_obj.group_id or "unknown"
+        msg_id = event.message_obj.message_id
+
+        # 消息级去重
+        async with self._msg_lock:
+            dedup_key = (group_id, msg_id)
+            if dedup_key in self._seen_messages:
+                return
+            self._seen_messages.add(dedup_key)
+            if len(self._seen_messages) > 10000:
+                self._seen_messages.clear()
+
+        # 正则+LLM 模式：语义验证过滤误报
+        if self.config.get("ddl_detect_mode", "仅正则") == "正则+LLM 验证":
+            provider_id = self.config.get("ddl_llm_provider", "") or None
+            verified = await classify_ddl(message_str, event, self.context, provider_id)
+            if verified is False:
+                return  # LLM 明确判断不是 DDL，跳过
+            if verified is not None:
+                # LLM 返回了更精准的 task/ddl_time
+                task_desc = verified["task"] or task_desc
+                ddl_time = verified["ddl_time"] or ddl_time
+                if verified["ddl_time"]:
+                    ddl_time = resolve_relative_time(verified["ddl_time"])
+
         sender_name = event.get_sender_name()
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 过滤已过期的 DDL（截止日早于当前时间）
+        deadline_dt = parse_ddl_time(ddl_time)
+        if deadline_dt and deadline_dt < datetime.now():
+            logger.info(f"DDL 已过期，跳过: {ddl_time}")
+            return
 
         raw_ddl = {
             "task": task_desc,
@@ -182,29 +174,28 @@ class DDLDetectPlugin(Star):
             "group_id": group_id,
             "sender": sender_name,
             "detected_at": timestamp,
-            "message_id": event.message_obj.message_id
+            "message_id": msg_id
         }
 
         await self._save_ddl(group_id, raw_ddl)
         self.monitored_groups.add(group_id)
         logger.info(f"检测到 DDL: {message_str}")
 
-        if self.config.get("enable_auto_reply", True):
-            if self.config.get("enable_llm_summary", True):
-                summary = await summarize_ddl(raw_ddl, event, self.context)
-                if summary:
-                    yield event.plain_result(f"已检测到 DDL：{summary}")
+        # LLM 总结（仅调用一次，结果缓存到 KV）
+        summary = await self._summarize_ddl_cached(group_id, raw_ddl, event)
+
+        if self.config.get("enable_auto_reply", False):
+            if summary:
+                yield event.plain_result(f"已检测到 DDL：{summary}")
 
         # 静默监听模式：跨平台推送给所有管理员
         if self.config.get("silent_mode", True) and self.admin_ids:
             silent_whitelist = self.config.get("silent_whitelist", False)
             group_list_str = self.config.get("silent_group_list", "")
-            if _should_monitor_group(group_id, silent_whitelist, group_list_str):
-                if self.config.get("enable_llm_summary", True):
-                    summary = await summarize_ddl(raw_ddl, event, self.context)
-                    if summary:
-                        raw_ddl["summary"] = summary
-                msg_text = _format_silent_msg(raw_ddl)
+            if should_monitor_group(group_id, silent_whitelist, group_list_str):
+                if summary:
+                    raw_ddl["summary"] = summary
+                msg_text = format_silent_msg(raw_ddl)
                 from astrbot.api.star import StarTools
                 import astrbot.api.message_components as Comp
                 from astrbot.api.event import MessageChain
@@ -222,10 +213,43 @@ class DDLDetectPlugin(Star):
     # ── 存储 ──────────────────────────────────────────────────
 
     async def _save_ddl(self, group_id: str, ddl_data: dict) -> None:
+        """保存 DDL（保存前清理过期 + KV 上限保护）"""
         key = f"ddl_{group_id}"
-        ddl_list = await self.get_kv_data(key, [])
-        ddl_list.append(ddl_data)
-        await self.put_kv_data(key, ddl_list)
+        lock = self._get_summary_lock(group_id)
+        async with lock:
+            ddl_list = await self.get_kv_data(key, [])
+            # 保存前清理过期
+            now = datetime.now()
+            ddl_list, removed = clean_expired_ddls(ddl_list, now)
+            ddl_list.append(ddl_data)
+            # 每群最多保留 MAX_DDL_PER_GROUP 条
+            if len(ddl_list) > MAX_DDL_PER_GROUP:
+                ddl_list = ddl_list[-MAX_DDL_PER_GROUP:]
+            await self.put_kv_data(key, ddl_list)
+
+    async def _summarize_ddl_cached(self, group_id: str, raw_ddl: dict,
+                                     event) -> str | None:
+        """带缓存的 LLM 总结：已有 summary 则跳过，否则调 LLM 并回存 KV（加锁防竞态）"""
+        if raw_ddl.get("summary"):
+            return raw_ddl["summary"]
+        if not self.config.get("enable_llm_summary", True):
+            return None
+        summary = await summarize_ddl(raw_ddl, event, self.context)
+        if not summary:
+            return None
+
+        raw_ddl["summary"] = summary
+        # 回存到 KV（加锁保证并发安全）
+        key = f"ddl_{group_id}"
+        lock = self._get_summary_lock(group_id)
+        async with lock:
+            ddl_list = await self.get_kv_data(key, [])
+            for ddl in ddl_list:
+                if ddl.get("message_id") == raw_ddl.get("message_id"):
+                    ddl["summary"] = summary
+                    break
+            await self.put_kv_data(key, ddl_list)
+        return summary
 
     # ── 查询 DDL ──────────────────────────────────────────────
 
@@ -237,47 +261,47 @@ class DDLDetectPlugin(Star):
         # 私聊：检查是否为管理员
         if not group_id:
             if self._is_admin(event):
-                result = await self._query_all_groups_ddl(event)
-                if isinstance(result, tuple):
-                    mode, content = result
-                    if mode == "image":
-                        yield event.image_result(content)
-                    else:
-                        yield event.plain_result(content)
+                results = await self._query_all_groups_ddl(event)
+                if isinstance(results, list):
+                    for mode, content in results:
+                        if mode == "image":
+                            yield event.image_result(content)
+                        else:
+                            yield event.plain_result(content)
                 else:
-                    yield event.plain_result(result)
+                    yield event.plain_result(results)
                 return
             yield event.plain_result("📭 私聊仅管理员(silent_admin_sid)可查看汇总")
             return
 
         # 群聊：查本群 DDL
         key = f"ddl_{group_id}"
-        result = await self._query_single_group(event, group_id, key)
-        if isinstance(result, tuple):
-            mode, content = result
-            if mode == "image":
-                yield event.image_result(content)
-            else:
-                yield event.plain_result(content)
+        results = await self._query_single_group(event, group_id, key)
+        if isinstance(results, list):
+            for mode, content in results:
+                if mode == "image":
+                    yield event.image_result(content)
+                else:
+                    yield event.plain_result(content)
         else:
-            yield event.plain_result(result)
+            yield event.plain_result(results)
 
     async def _query_single_group(self, event, group_id, key):
-        """查询并格式化单个群的 DDL"""
+        """查询并格式化单个群的 DDL，返回 list[tuple] 或 str"""
         ddl_list = await self.get_kv_data(key, [])
         now = datetime.now()
-        valid_ddls, removed_count = _clean_expired_ddls(ddl_list, now)
+        valid_ddls, removed_count = clean_expired_ddls(ddl_list, now)
         if removed_count > 0:
             await self.put_kv_data(key, valid_ddls)
 
-        today_ddls = _filter_today(valid_ddls)
+        today_ddls = filter_today(valid_ddls)
         if not today_ddls:
             return "📭 今日暂无 DDL 记录"
 
         return await self._format_ddl_output(event, group_id, today_ddls)
 
     async def _query_all_groups_ddl(self, event):
-        """汇总所有监听群的 DDL（管理员专用），归并到一张卡片"""
+        """汇总所有监听群的 DDL（管理员专用），归并到一张卡片。返回 list[tuple] 或 str"""
         groups = sorted(self.monitored_groups)
         if not groups:
             return "📭 暂无监听的群组"
@@ -287,17 +311,17 @@ class DDLDetectPlugin(Star):
         all_today_ddls = []
 
         for gid in groups:
-            if not _should_monitor_group(gid, silent_whitelist, group_list_str):
+            if not should_monitor_group(gid, silent_whitelist, group_list_str):
                 continue
 
             key = f"ddl_{gid}"
             ddl_list = await self.get_kv_data(key, [])
             now = datetime.now()
-            valid_ddls, removed_count = _clean_expired_ddls(ddl_list, now)
+            valid_ddls, removed_count = clean_expired_ddls(ddl_list, now)
             if removed_count > 0:
                 await self.put_kv_data(key, valid_ddls)
 
-            today_ddls = _filter_today(valid_ddls)
+            today_ddls = filter_today(valid_ddls)
             for ddl in today_ddls:
                 ddl["group_id"] = gid
             all_today_ddls.extend(today_ddls)
@@ -310,21 +334,19 @@ class DDLDetectPlugin(Star):
         return await self._format_ddl_output(event, merged_id, all_today_ddls)
 
     async def _format_ddl_output(self, event, group_id, today_ddls):
-        """格式化单个群的 DDL 输出，返回 (type, content)"""
+        """格式化 DDL 输出，返回 list[(type, content)]。图片模式先返回渲染提示"""
         urgent_hours = self.config.get("urgent_hours", 24)
         soon_hours = self.config.get("soon_hours", 48)
         urgent_ddls, soon_ddls, normal_ddls = categorize_ddls(today_ddls, urgent_hours, soon_hours)
-
-        if self.config.get("enable_llm_summary", True):
-            for ddl in urgent_ddls + soon_ddls + normal_ddls:
-                summary = await summarize_ddl(ddl, event, self.context)
-                if summary:
-                    ddl['summary'] = summary
-
-        output_format = group_output_format.get(
-            group_id,
-            "image" if self.config.get("output_as_image", True) else "text"
-        )
+        gen_time = datetime.now().strftime("%H:%M:%S")
+        # 不在查询时实时调 LLM 总结，避免 /ddl 卡死
+        # 总结仅在 DDL 首次检测时由 _summarize_ddl_cached 完成
+        output_as_image = self.config.get("output_as_image", True)
+        # 容错：AstrBot 可能将 bool 存为字符串
+        if isinstance(output_as_image, str):
+            output_as_image = output_as_image.lower() in ("true", "1", "yes")
+        output_format = "image" if output_as_image else "text"
+        logger.info(f"[_format_ddl_output] output_as_image={self.config.get('output_as_image')} → {output_format}")
         source_info = ""
         if group_id == "__admin_all_groups__":
             source_info = self._build_source_info(today_ddls)
@@ -339,13 +361,23 @@ class DDLDetectPlugin(Star):
                 url = await render_image_card(
                     self, urgent_ddls, soon_ddls, normal_ddls,
                     urgent_hours, soon_hours, bg_mode, bg_value,
-                    source_info=source_info
+                    source_info=source_info, gen_time=gen_time
                 )
-                return ("image", url)
+                return [
+                    ("text", f"🎨 正在渲染图片（{gen_time}），请稍候..."),
+                    ("image", url),
+                ]
             except Exception as e:
                 logger.error(f"生成图片失败: {e}")
-        return ("text", format_text_ddl(urgent_ddls, soon_ddls, normal_ddls,
-                                         urgent_hours, soon_hours, source_info))
+                fallback = format_text_ddl(urgent_ddls, soon_ddls, normal_ddls,
+                                           urgent_hours, soon_hours, source_info)
+                return [
+                    ("text", f"❌ 图片生成失败: {e}"),
+                    ("text", fallback + f"\n\n🕐 {gen_time}"),
+                ]
+        # 文字模式
+        return [("text", format_text_ddl(urgent_ddls, soon_ddls, normal_ddls,
+                                         urgent_hours, soon_hours, source_info) + f"\n\n🕐 {gen_time}")]
 
     # ── 清除 DDL ──────────────────────────────────────────────
 
@@ -395,65 +427,6 @@ class DDLDetectPlugin(Star):
         self.monitored_groups.clear()
         return f"✅ 已清除 {total_removed} 个群的全部 DDL 记录"
 
-    # ── 切换输出格式 ──────────────────────────────────────────
-
-    @filter.command("ddl_image")
-    async def switch_to_image(self, event: AstrMessageEvent) -> MessageEventResult:
-        group_id = event.message_obj.group_id or "unknown"
-        group_output_format[group_id] = "image"
-        yield event.plain_result("✅ 已切换到图片输出模式")
-
-    @filter.command("ddl_text")
-    async def switch_to_text(self, event: AstrMessageEvent) -> MessageEventResult:
-        group_id = event.message_obj.group_id or "unknown"
-        group_output_format[group_id] = "text"
-        yield event.plain_result("✅ 已切换到文字输出模式")
-
-    # ── 测试 ──────────────────────────────────────────────────
-
-    @filter.command("ddl_test")
-    async def test_notification(self, event: AstrMessageEvent) -> MessageEventResult:
-        """测试定时通知"""
-        group_id = event.message_obj.group_id or "unknown"
-        key = f"ddl_{group_id}"
-        ddl_list = await self.get_kv_data(key, [])
-        today = datetime.now().strftime("%Y-%m-%d")
-        today_ddls = [ddl for ddl in ddl_list if ddl.get('detected_at', '').startswith(today)]
-
-        if not today_ddls:
-            yield event.plain_result("今日暂无 DDL 可测试")
-            return
-
-        urgent_hours = self.config.get("urgent_hours", 24)
-        soon_hours = self.config.get("soon_hours", 48)
-        urgent_ddls, soon_ddls, normal_ddls = categorize_ddls(today_ddls, urgent_hours, soon_hours)
-
-        output_format = group_output_format.get(
-            group_id,
-            "image" if self.config.get("output_as_image", True) else "text"
-        )
-
-        if self.config.get("enable_llm_summary", True):
-            for ddl in urgent_ddls + soon_ddls + normal_ddls:
-                summary = await summarize_ddl(ddl, event, self.context)
-                if summary:
-                    ddl['summary'] = summary
-
-        if output_format == "image":
-            try:
-                bg_as_image = self.config.get("background_as_image", True)
-                bg_value = self.config.get("background_color", "#f0f0f0") if not bg_as_image else self.config.get("background_api", "https://t.alcy.cc/moez")
-                bg_mode = "image" if bg_as_image else "color"
-                url = await render_image_card(
-                    self, urgent_ddls, soon_ddls, normal_ddls,
-                    urgent_hours, soon_hours, bg_mode, bg_value
-                )
-                yield event.image_result(url)
-            except Exception as e:
-                yield event.plain_result(f"生成测试图片失败: {e}")
-        else:
-            yield event.plain_result(format_text_ddl(urgent_ddls, soon_ddls, normal_ddls, urgent_hours, soon_hours))
-
     @filter.command("ddl_remind_test")
     async def test_reminder(self, event: AstrMessageEvent) -> MessageEventResult:
         """手动触发截止前提醒测试"""
@@ -468,9 +441,7 @@ class DDLDetectPlugin(Star):
             yield event.plain_result("📭 暂无监听的群组")
             return
 
-        # 临时清空去重集，允许再次提醒
-        self._reminded_ddls.clear()
-
+        # force 模式直接跳过去重，不影响后台循环的 _reminded_ddls
         persona_id = self.config.get("deadline_remind_persona", "")
         persona_note = f"（人格: {persona_id}）" if persona_id else "（使用默认人格）"
         yield event.plain_result(f"🔄 强制触发提醒{persona_note}，开始生成...")
@@ -484,26 +455,188 @@ class DDLDetectPlugin(Star):
                 f"解析失败 {skip_p} 条）"
             )
 
-    @filter.command("ddl_personas")
-    async def list_personas(self, event: AstrMessageEvent) -> MessageEventResult:
-        """列出 AstrBot 中可用的人格列表"""
-        try:
-            persona_mgr = self.context.persona_manager
-            personas = await persona_mgr.get_all_personas()
-            if not personas:
-                yield event.plain_result("📭 当前无可用人格，请在 AstrBot 人格设置中创建")
-                return
+    @filter.command("ddl_debug")
+    async def debug_ddl(self, event: AstrMessageEvent) -> MessageEventResult:
+        """调试模式：逐步追踪 DDL 检测全过程（仅管理员）"""
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 仅管理员可用 /ddl_debug")
+            return
+        if not self.config.get("debug_mode", False):
+            yield event.plain_result("⚠️ 调试模式未开启，请在设置中启用 debug_mode")
+            return
 
-            lines = ["📋 可用人格列表（填入 deadline_remind_persona）："]
-            for p in personas:
-                pid = getattr(p, 'persona_id', '?')
-                lines.append(f"  - {pid}")
+        # 获取测试消息
+        test_msg = event.message_str.strip()
+        prefix = "/ddl_debug"
+        if test_msg.startswith(prefix):
+            test_msg = test_msg[len(prefix):].strip()
+        if not test_msg:
+            yield event.plain_result("用法: /ddl_debug <测试消息>")
+            return
+
+        lines = ["🔍 DDL 调试追踪", "─" * 30, f"📝 输入: {test_msg}", ""]
+
+        # Step 1: 关键词 + 正则
+        lines.append("【1】关键词 → 正则模式")
+        lines.append(f"  关键词: {self.keywords}")
+        if self.custom_time_patterns:
+            lines.append(f"  自定义时间模式: {self.custom_time_patterns}")
+        lines.append(f"  完整正则: {self.ddl_pattern.pattern[:120]}...")
+        lines.append("")
+
+        # Step 2: 正则匹配
+        ddl_info = extract_ddl(test_msg, self.ddl_pattern, resolve_relative_time, self.time_re)
+        if not ddl_info:
+            lines.append("【2】正则匹配 ❌ 未命中")
+            lines.append("  检测结束：正则未匹配到 DDL 格式")
             yield event.plain_result("\n".join(lines))
-        except Exception as e:
-            yield event.plain_result(f"获取人格列表失败: {e}")
+            return
 
+        task_desc, ddl_time = ddl_info
+        lines.append("【2】正则匹配 ✅ 命中")
+        lines.append(f"  匹配文本: {self.ddl_pattern.search(test_msg).group(0) if self.ddl_pattern.search(test_msg) else '?'}")
+        lines.append(f"  提取 task: {task_desc[:60]}{'...' if len(task_desc) > 60 else ''}")
+        lines.append(f"  提取 time: {ddl_time}")
+        lines.append(f"  resolve_relative_time: {ddl_time} → {resolve_relative_time(ddl_time) if ddl_time else '?'}")
+        lines.append("")
+
+        # Step 3: LLM 语义验证（如果开启）
+        detect_mode = self.config.get("ddl_detect_mode", "仅正则")
+        lines.append(f"【3】检测模式: {detect_mode}")
+
+        if detect_mode == "正则+LLM 验证":
+            provider_id = self.config.get("ddl_llm_provider", "") or None
+            lines.append("")
+            lines.append("【3a】LLM 语义验证 - 发送 prompt:")
+            prompt_text = CLASSIFY_PROMPT + test_msg
+            # 截断过长 prompt
+            if len(prompt_text) > 300:
+                lines.append(f"  {prompt_text[:150]}")
+                lines.append(f"  ...(省略 {len(prompt_text) - 300} 字)...")
+                lines.append(f"  ...{prompt_text[-150:]}")
+            else:
+                for line in prompt_text.split("\n"):
+                    lines.append(f"  {line}")
+            lines.append("")
+
+            try:
+                if not provider_id:
+                    umo = event.unified_msg_origin
+                    provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+                if not provider_id:
+                    lines.append("【3b】LLM 响应: ❌ 未找到可用的 LLM 模型")
+                    lines.append("  → 检测结果: 放行（使用正则结果）")
+                else:
+                    lines.append(f"【3b】使用模型: {provider_id}")
+                    llm_resp = await self.context.llm_generate(
+                        chat_provider_id=provider_id,
+                        prompt=CLASSIFY_PROMPT + test_msg,
+                    )
+                    if not llm_resp or not llm_resp.completion_text:
+                        lines.append("【3c】LLM 响应: ❌ 空响应")
+                        lines.append("  → 检测结果: 放行（使用正则结果）")
+                    else:
+                        raw = llm_resp.completion_text.strip()
+                        lines.append(f"【3c】LLM 原始响应: {raw}")
+                        # 解析
+                        import json as _json
+                        clean = raw
+                        if clean.startswith("```"):
+                            clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                        try:
+                            result = _json.loads(clean)
+                            if result.get("is_ddl"):
+                                lines.append(f"【3d】解析结果: ✅ 是 DDL")
+                                lines.append(f"  LLM task: {result.get('task', '?')}")
+                                lines.append(f"  LLM time: {result.get('ddl_time', '?')}")
+                                # Apply LLM correction
+                                if result.get("task"):
+                                    task_desc = result["task"]
+                                if result.get("ddl_time"):
+                                    ddl_time = resolve_relative_time(result["ddl_time"])
+                            else:
+                                lines.append(f"【3d】解析结果: ❌ 不是 DDL（误报过滤）")
+                                lines.append("  → 检测结束：LLM 判定为误报，不触发")
+                                yield event.plain_result("\n".join(lines))
+                                return
+                        except _json.JSONDecodeError:
+                            lines.append(f"【3d】解析结果: ⚠️ JSON 解析失败，放行")
+            except Exception as e:
+                lines.append(f"【3】LLM 调用异常: {e}")
+                lines.append("  → 检测结果: 放行（使用正则结果）")
+        else:
+            lines.append("  → 仅正则模式，跳过 LLM 验证")
+        lines.append("")
+
+        # Step 4: 过期检查
+        lines.append("【4】过期检查")
+        parsed = parse_ddl_time(ddl_time)
+        lines.append(f"  parse_ddl_time('{ddl_time}') → {parsed}")
+        if parsed:
+            import datetime as _dt
+            now_dt = _dt.datetime.now()
+            if parsed < now_dt:
+                lines.append(f"  ⚠️ 截止时间已过！({parsed} < {now_dt})")
+                lines.append(f"  → 该 DDL 在正常流程中会被跳过，不保存/不回复")
+                yield event.plain_result("\n".join(lines))
+                return
+            remaining = (parsed - now_dt).total_seconds() / 3600
+            lines.append(f"  ✅ 未过期，剩余: {remaining:.1f} 小时")
+        lines.append("")
+
+        # Step 5: LLM 总结测试（实际调用并展示 prompt + 响应）
+        lines.append("【5】LLM 总结测试")
+        if self.config.get("enable_llm_summary", True):
+            dummy_ddl = {"task": task_desc, "ddl_time": ddl_time}
+            summary_prompt = f"用不超过50个字总结以下DDL任务，不要带任何标点符号，直接输出总结文本：\n\n任务：{dummy_ddl.get('task', '?')}\n截止：{dummy_ddl['ddl_time']}"
+            lines.append(f"  发送 prompt:")
+            for pline in summary_prompt.split("\n"):
+                lines.append(f"    {pline}")
+            lines.append("")
+            try:
+                import re as _re
+                # 手动调 LLM 以获取原始响应
+                umo = event.unified_msg_origin
+                llm_pid = await self.context.get_current_chat_provider_id(umo=umo)
+                if llm_pid:
+                    raw_resp = await self.context.llm_generate(
+                        chat_provider_id=llm_pid,
+                        prompt=summary_prompt,
+                    )
+                    if raw_resp and raw_resp.completion_text:
+                        raw_text = raw_resp.completion_text.strip()
+                        lines.append(f"  LLM 原始响应: {raw_text}")
+                        # 展示清洗过程
+                        cleaned = _re.sub(r'[，。！？、；：""''（）【】《》\s]', '', raw_text)
+                        cleaned = cleaned[:50] if len(cleaned) > 50 else cleaned
+                        lines.append(f"  清洗后: {cleaned}")
+                    else:
+                        lines.append(f"  LLM 原始响应: (空)")
+                else:
+                    lines.append(f"  未找到 LLM 模型")
+            except Exception as e:
+                lines.append(f"  总结异常: {e}")
+        else:
+            lines.append("  ❌ LLM 总结: 已关闭")
+        lines.append("")
+
+        # Step 6: 会触发什么
+        lines.append("【6】触发行为")
+        if self.config.get("enable_auto_reply", False):
+            lines.append("  ✅ auto_reply: 会在群内回复")
+        else:
+            lines.append("  ❌ auto_reply: 已关闭")
+        if self.config.get("silent_mode", True) and self.admin_ids:
+            lines.append(f"  ✅ silent_push: 会推送给 {len(self.admin_ids)} 位管理员")
+        else:
+            lines.append("  ❌ silent_push: 未启用或无管理员")
+        if self.config.get("enable_llm_summary", True):
+            lines.append("  ✅ LLM 总结: 会调用 LLM 生成摘要")
+        else:
+            lines.append("  ❌ LLM 总结: 已关闭")
+
+        yield event.plain_result("\n".join(lines))
     # ── 销毁 ──────────────────────────────────────────────────
-
     async def terminate(self) -> None:
         if self.notification_task and not self.notification_task.done():
             self.notification_task.cancel()
@@ -545,46 +678,50 @@ class DDLDetectPlugin(Star):
             await asyncio.sleep(300)  # 每 5 分钟检查一次
 
     async def _check_deadline_reminders(self, remind_hours: float, force: bool = False):
-        """检查所有监听群的 DDL，提醒即将截止的。force=True 时忽略时间窗口，强制发送第一条。
-        返回 (发送数, 总数, 过滤数)"""
+        """检查所有监听群的 DDL，提醒即将截止的。force=True 时忽略时间窗口和去重，仅取第一条。
+        先收集所有窗口内 DDL，汇总为一张表一次性发给 LLM，减少 Token 消耗。
+        返回 (发送数, 检查数, 窗口内数, 解析失败数)"""
         from astrbot.api.star import StarTools
         import astrbot.api.message_components as Comp
         from astrbot.api.event import MessageChain
-        from lib.time_parser import parse_ddl_time as _parse_time
 
         now = datetime.now()
-        notified_count = 0
         total_checked = 0
-        skipped_time = 0
         skipped_parse = 0
+        sent_dedup_keys = []
+
+        # ── 第一遍：收集所有窗口内的DDL ──
+        pending_ddls = []  # [(group_label, task, sender, hours_left, ddl_time_str, gid, ddl), ...]
 
         for gid in list(self.monitored_groups):
             silent_whitelist = self.config.get("silent_whitelist", False)
             group_list_str = self.config.get("silent_group_list", "")
-            if not _should_monitor_group(gid, silent_whitelist, group_list_str):
+            if not should_monitor_group(gid, silent_whitelist, group_list_str):
                 continue
 
             key = f"ddl_{gid}"
             ddl_list = await self.get_kv_data(key, [])
-            valid_ddls, _ = _clean_expired_ddls(ddl_list, now)
+            valid_ddls, _ = clean_expired_ddls(ddl_list, now)
 
             for ddl in valid_ddls:
                 total_checked += 1
                 ddl_time_str = ddl.get('ddl_time', '')
+                deadline = parse_ddl_time(ddl_time_str)
 
                 if force:
-                    # 强制模式：跳过时间窗口和去重，仅取第一条有效 DDL
-                    if notified_count >= 1:
+                    # 强制模式：跳过时间窗口和去重，仅取第一条
+                    if pending_ddls:
                         continue
-                else:
-                    deadline = _parse_time(ddl_time_str)
                     if not deadline:
                         skipped_parse += 1
                         continue
-
+                    remaining = max(0, (deadline - now).total_seconds() / 3600)
+                else:
+                    if not deadline:
+                        skipped_parse += 1
+                        continue
                     remaining = (deadline - now).total_seconds() / 3600
                     if remaining < 0 or remaining > remind_hours:
-                        skipped_time += 1
                         continue
 
                     # 去重
@@ -592,84 +729,112 @@ class DDLDetectPlugin(Star):
                     if dedup_key in self._reminded_ddls:
                         continue
                     self._reminded_ddls.add(dedup_key)
+                    sent_dedup_keys.append(dedup_key)
 
-                deadline = _parse_time(ddl_time_str) if force else deadline
-                remaining = max(0, ((deadline - now).total_seconds() / 3600) if deadline else 0)
-
-                # 构建提醒
                 group_label = self._get_group_label(gid)
                 task = ddl.get('summary') or ddl.get('task', ddl.get('raw_message', ''))
                 sender = ddl.get('sender', '未知')
                 hours_left = max(0, round(remaining * 10) / 10)
 
-                # 尝试用人格 + LLM 生成提醒
-                persona_prompt = await self._get_persona_prompt()
-                if persona_prompt:
-                    try:
-                        provider_id = await self.context.get_current_chat_provider_id(
-                            umo=f"__ddl_reminder__:{gid}"
-                        )
-                        if not provider_id:
-                            provider_id = await self.context.get_current_chat_provider_id(
-                                umo="__ddl_reminder__"
-                            )
-                    except Exception:
-                        provider_id = None
+                pending_ddls.append((group_label, task, sender, hours_left, ddl_time_str))
 
-                    if provider_id:
-                        try:
-                            remind_prompt = (
-                                f"{persona_prompt}\n\n"
-                                f"现在需要提醒：来自群「{group_label}」的 {sender} "
-                                f"有一个任务「{task}」将在 {hours_left} 小时后截止（{ddl_time_str}）。"
-                                f"请用你的语气生成一条简洁的提醒消息（不超过100字）。"
-                            )
-                            llm_resp = await self.context.llm_generate(
-                                chat_provider_id=provider_id,
-                                prompt=remind_prompt,
-                            )
-                            if llm_resp and llm_resp.completion_text:
-                                msg_text = llm_resp.completion_text.strip()
-                            else:
-                                msg_text = f"⏰ 提醒：群「{group_label}」中 {sender} 的任务「{task}」将在 {hours_left} 小时后截止（{ddl_time_str}）"
-                        except Exception as e:
-                            logger.warning(f"[DeadlineReminder] LLM 生成失败: {e}")
-                            msg_text = f"⏰ 提醒：群「{group_label}」中 {sender} 的任务「{task}」将在 {hours_left} 小时后截止（{ddl_time_str}）"
-                    else:
-                        msg_text = f"⏰ 提醒：群「{group_label}」中 {sender} 的任务「{task}」将在 {hours_left} 小时后截止（{ddl_time_str}）"
-                else:
-                    msg_text = f"⏰ 提醒：群「{group_label}」中 {sender} 的任务「{task}」将在 {hours_left} 小时后截止（{ddl_time_str}）"
+        if not pending_ddls:
+            if sent_dedup_keys:
+                await self._persist_reminded_ddls()
+            logger.info(f"[DeadlineReminder] 检查 {total_checked} 条 DDL，窗口内 {len(pending_ddls)} 条，无需提醒，解析失败 {skipped_parse}")
+            return (0, total_checked, len(pending_ddls), skipped_parse)
 
-                # 推送给所有管理员
-                for admin_id in self.admin_ids:
-                    sessions = self._get_admin_sessions(admin_id)
-                    if not sessions:
-                        logger.warning(f"[DeadlineReminder] 无法解析 admin {admin_id} 的平台")
-                        continue
-                    try:
-                        chain = MessageChain()
-                        chain.chain.append(Comp.Plain(msg_text))
-                        sent_ok = False
-                        for session in sessions:
-                            try:
-                                await StarTools.send_message(session, chain)
-                                sent_ok = True
-                                break
-                            except Exception:
-                                continue
-                        if sent_ok:
-                            notified_count += 1
-                        else:
-                            logger.warning(f"[DeadlineReminder] 所有平台均无法向 {admin_id} 发送")
-                    except Exception as e:
-                        logger.warning(f"[DeadlineReminder] 发送失败: {e}")
+        # ── 第二遍：构建汇总表格，一次性调用 LLM ──
+        table_lines = ["| 群 | 任务 | 来自 | 剩余时间 | 截止时间 |"]
+        table_lines.append("|---|---|---|---|---|")
+        for group_label, task, sender, hours_left, ddl_time_str in pending_ddls:
+            table_lines.append(f"| {group_label} | {task} | {sender} | {hours_left}h | {ddl_time_str} |")
+        ddl_table = "\n".join(table_lines)
 
-        if notified_count > 0:
-            logger.info(f"[DeadlineReminder] 已推送 {notified_count} 条截止提醒")
+        persona_prompt = await self._get_persona_prompt()
+        if persona_prompt:
+            try:
+                provider_id = await self.context.get_current_chat_provider_id(
+                    umo="__ddl_reminder__"
+                )
+                if not provider_id:
+                    provider_id = await self.context.get_current_chat_provider_id(
+                        umo="__ddl_reminder__"
+                    )
+            except Exception:
+                provider_id = None
         else:
-            logger.info(f"[DeadlineReminder] 检查 {total_checked} 条 DDL，均不在截止窗口内（解析失败 {skipped_parse}，时间不匹配 {skipped_time}）")
+            provider_id = None
 
-        return (notified_count, total_checked, skipped_time, skipped_parse)
+        if persona_prompt and provider_id:
+            try:
+                batch_prompt = (
+                    f"{persona_prompt}\n\n"
+                    f"以下是一批即将截止的 DDL 任务列表，请根据你的语气生成一条简洁的汇总提醒消息（不超过200字），"
+                    f"列明每个群的任务和截止时间：\n\n{ddl_table}"
+                )
+                llm_resp = await self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=batch_prompt,
+                )
+                if llm_resp and llm_resp.completion_text:
+                    msg_text = llm_resp.completion_text.strip()
+                else:
+                    msg_text = self._build_fallback_reminder(pending_ddls)
+            except Exception as e:
+                logger.warning(f"[DeadlineReminder] LLM 批量生成失败: {e}")
+                msg_text = self._build_fallback_reminder(pending_ddls)
+        else:
+            msg_text = self._build_fallback_reminder(pending_ddls)
+
+        # ── 推送给所有管理员（所有 DDL 合并为一条消息） ──
+        notified_count = 0
+        for admin_id in self.admin_ids:
+            sessions = self._get_admin_sessions(admin_id)
+            if not sessions:
+                logger.warning(f"[DeadlineReminder] 无法解析 admin {admin_id} 的平台")
+                continue
+            try:
+                chain = MessageChain()
+                chain.chain.append(Comp.Plain(msg_text))
+                sent_ok = False
+                for session in sessions:
+                    try:
+                        await StarTools.send_message(session, chain)
+                        sent_ok = True
+                        break
+                    except Exception:
+                        continue
+                if sent_ok:
+                    notified_count += 1
+                else:
+                    logger.warning(f"[DeadlineReminder] 所有平台均无法向 {admin_id} 发送")
+            except Exception as e:
+                logger.warning(f"[DeadlineReminder] 发送失败: {e}")
+
+        # 持久化去重集
+        if sent_dedup_keys:
+            await self._persist_reminded_ddls()
+
+        logger.info(
+            f"[DeadlineReminder] 检查 {total_checked} 条 DDL，窗口内 {len(pending_ddls)} 条，"
+            f"已推送 {notified_count} 位管理员"
+        )
+        return (notified_count, total_checked, len(pending_ddls), skipped_parse)
+
+    def _build_fallback_reminder(self, pending_ddls: list) -> str:
+        """构造无 LLM 时的兜底提醒文本（所有 DDL 汇总为一条消息）"""
+        lines = ["⏰ DDL 截止提醒", ""]
+        for group_label, task, sender, hours_left, ddl_time_str in pending_ddls:
+            lines.append(f"  【{group_label}】{task}")
+            lines.append(f"  来自 {sender} | 剩余 {hours_left}h | 截止 {ddl_time_str}")
+            lines.append("")
+        return "\n".join(lines)
+
+    async def _persist_reminded_ddls(self):
+        """将 _reminded_ddls 持久化到 KV（最多保留最近 500 条）"""
+        data = list(self._reminded_ddls)[-500:]
+        await self.put_kv_data("__reminded_ddls", data)
 
     async def _get_persona_prompt(self) -> str:
         """获取截止提醒人格提示词"""

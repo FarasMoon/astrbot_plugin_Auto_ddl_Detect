@@ -4,6 +4,27 @@
     "type": "string",
     "default": "截止,截止时间,截止日期,deadline,ddl,交作业"
   },
+  "ddl_detect_mode": {
+    "description": "DDL 检测模式",
+    "type": "string",
+    "default": "仅正则",
+    "hint": "仅正则: 速度快零token；正则+LLM: 语义验证过滤误报（如闲聊中提及截止）",
+    "options": ["仅正则", "正则+LLM 验证"]
+  },
+  "ddl_llm_provider": {
+    "description": "DDL 验证使用的 LLM 提供商",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "留空使用群聊默认模型；选择后仅用于 DDL 语义验证",
+    "condition": {"ddl_detect_mode": "正则+LLM 验证"}
+  },
+  "custom_time_patterns": {
+    "description": "自定义时间正则（每行一条，追加到内置规则后）",
+    "type": "string",
+    "default": "",
+    "hint": "每行一条 Python 正则，如: \\d{4}-\\d{2}-\\d{2}；留空仅用内置规则"
+  },
   "enable_llm_summary": {
     "description": "是否启用 LLM 总结（图片和文字模式均支持）",
     "type": "bool",
@@ -115,5 +136,11 @@
     "default": "",
     "_special": "select_persona",
     "hint": "留空使用默认人格；选择后 LLM 将按该人格风格生成提醒文案"
+  },
+  "debug_mode": {
+    "description": "调试模式（管理员可用 /ddl_debug 命令测试任意消息）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后 /ddl_debug <消息> 可逐步追踪 DDL 检测全过程"
   }
 }
